@@ -45,6 +45,104 @@ from kiro.converters_core import (
 )
 
 
+WEB_SEARCH_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Search query"},
+        "count": {"type": "integer", "description": "Maximum number of results to return"},
+        "freshness": {"type": "string", "description": "Freshness window for search results"},
+        "country": {"type": "string", "description": "Country or region hint for search results"},
+        "fetch_content": {"type": "boolean", "description": "Whether to fetch page content"},
+    },
+    "required": ["query"],
+}
+
+
+WEB_SEARCH_TOOL_DESCRIPTION = (
+    "Search the web for current information. Use when you need up-to-date data "
+    "from the internet."
+)
+
+
+def _get_content_block_value(block: Any, field_name: str, default: Any = None) -> Any:
+    """
+    Read a field from a dict or Pydantic content block.
+
+    Args:
+        block: Content block represented as a dict or model object.
+        field_name: Field to read from the block.
+        default: Value returned when the field is absent.
+
+    Returns:
+        The field value or default.
+    """
+    if isinstance(block, dict):
+        return block.get(field_name, default)
+
+    return getattr(block, field_name, default)
+
+
+def _format_web_search_tool_result(block: Any) -> str:
+    """
+    Convert a web_search_tool_result block into readable text.
+
+    Anthropic server-side web_search result blocks are assistant history,
+    not ordinary user tool_result blocks. Kiro has no native equivalent, so
+    preserving the search evidence as text keeps the conversation context
+    intact without forwarding unsupported block types.
+
+    Args:
+        block: Dict or Pydantic web_search_tool_result content block.
+
+    Returns:
+        Human-readable search result summary, or an empty string.
+    """
+    tool_use_id = _get_content_block_value(block, "tool_use_id", "")
+    result_content = _get_content_block_value(block, "content", None)
+
+    if isinstance(result_content, str):
+        return result_content
+
+    if not isinstance(result_content, list):
+        return ""
+
+    result_lines: List[str] = []
+    for index, result_block in enumerate(result_content, start=1):
+        result_type = _get_content_block_value(result_block, "type", None)
+        if result_type == "text":
+            text = _get_content_block_value(result_block, "text", "")
+            if text:
+                result_lines.append(text)
+            continue
+
+        if result_type != "web_search_result":
+            continue
+
+        title = _get_content_block_value(result_block, "title", "") or "Untitled"
+        url = _get_content_block_value(result_block, "url", "")
+        snippet = _get_content_block_value(result_block, "encrypted_content", "")
+        page_age = _get_content_block_value(result_block, "page_age", "")
+
+        parts = [f"{index}. Title: {title}"]
+        if url:
+            parts.append(f"   URL: {url}")
+        if page_age:
+            parts.append(f"   Page age: {page_age}")
+        if snippet:
+            parts.append(f"   Snippet: {snippet}")
+
+        result_lines.append("\n".join(parts))
+
+    if not result_lines:
+        return ""
+
+    heading = "[Web Search Results]"
+    if tool_use_id:
+        heading = f"[Web Search Results ({tool_use_id})]"
+
+    return f"{heading}\n" + "\n\n".join(result_lines)
+
+
 def convert_anthropic_content_to_text(content: Any) -> str:
     """
     Extracts text content from Anthropic message content.
@@ -52,6 +150,7 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     Anthropic content can be:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
+    - Server-side web_search result blocks, converted to readable text
 
     Args:
         content: Anthropic message content
@@ -65,11 +164,13 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     if isinstance(content, list):
         text_parts = []
         for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-            elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
+            block_type = _get_content_block_value(block, "type", None)
+            if block_type == "text":
+                text_parts.append(_get_content_block_value(block, "text", ""))
+            elif block_type == "web_search_tool_result":
+                formatted_result = _format_web_search_tool_result(block)
+                if formatted_result:
+                    text_parts.append(formatted_result)
         return "".join(text_parts)
 
     return str(content) if content else ""
@@ -227,16 +328,11 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
         tool_name = None
         tool_input = {}
 
-        if isinstance(block, dict):
-            block_type = block.get("type")
-            tool_id = block.get("id")
-            tool_name = block.get("name")
-            tool_input = block.get("input", {})
-        elif hasattr(block, "type"):
-            block_type = block.type
-            tool_id = getattr(block, "id", None)
-            tool_name = getattr(block, "name", None)
-            tool_input = getattr(block, "input", {})
+        if isinstance(block, dict) or hasattr(block, "type"):
+            block_type = _get_content_block_value(block, "type", None)
+            tool_id = _get_content_block_value(block, "id", None)
+            tool_name = _get_content_block_value(block, "name", None)
+            tool_input = _get_content_block_value(block, "input", {})
 
         if block_type == "tool_use" and tool_id and tool_name:
             tool_calls.append(
@@ -358,10 +454,33 @@ def convert_anthropic_tools(
             name = tool.get("name", "")
             description = tool.get("description")
             input_schema = tool.get("input_schema", {})
+            tool_type = tool.get("type")
         else:
             name = tool.name
             description = tool.description
             input_schema = tool.input_schema
+            tool_type = tool.type
+
+        if tool_type and tool_type.startswith("web_search"):
+            logger.debug(
+                f"Converting Anthropic server-side web_search tool '{name}' to Kiro "
+                f"tool spec for MCP emulation (type={tool_type})"
+            )
+            unified_tools.append(
+                UnifiedTool(
+                    name="web_search",
+                    description=description or WEB_SEARCH_TOOL_DESCRIPTION,
+                    input_schema=input_schema or WEB_SEARCH_TOOL_SCHEMA,
+                )
+            )
+            continue
+
+        if tool_type:
+            logger.debug(
+                f"Skipping Anthropic server-side tool '{name}' during Kiro tool conversion "
+                f"(type={tool_type})"
+            )
+            continue
 
         unified_tools.append(
             UnifiedTool(name=name, description=description, input_schema=input_schema)
