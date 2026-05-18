@@ -45,6 +45,25 @@ from kiro.converters_core import (
 )
 
 
+WEB_SEARCH_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Search query"},
+        "count": {"type": "integer", "description": "Maximum number of results to return"},
+        "freshness": {"type": "string", "description": "Freshness window for search results"},
+        "country": {"type": "string", "description": "Country or region hint for search results"},
+        "fetch_content": {"type": "boolean", "description": "Whether to fetch page content"},
+    },
+    "required": ["query"],
+}
+
+
+WEB_SEARCH_TOOL_DESCRIPTION = (
+    "Search the web for current information. Use when you need up-to-date data "
+    "from the internet."
+)
+
+
 def _get_content_block_value(block: Any, field_name: str, default: Any = None) -> Any:
     """
     Read a field from a dict or Pydantic content block.
@@ -441,6 +460,20 @@ def convert_anthropic_tools(
             description = tool.description
             input_schema = tool.input_schema
             tool_type = tool.type
+
+        if tool_type and tool_type.startswith("web_search"):
+            logger.debug(
+                f"Converting Anthropic server-side web_search tool '{name}' to Kiro "
+                f"tool spec for MCP emulation (type={tool_type})"
+            )
+            unified_tools.append(
+                UnifiedTool(
+                    name="web_search",
+                    description=description or WEB_SEARCH_TOOL_DESCRIPTION,
+                    input_schema=input_schema or WEB_SEARCH_TOOL_SCHEMA,
+                )
+            )
+            continue
 
         if tool_type:
             logger.debug(

@@ -1580,10 +1580,10 @@ class TestConvertAnthropicTools:
         assert result is not None
         assert result[0].description is None
 
-    def test_skips_server_side_tools(self):
+    def test_converts_server_side_web_search_tool_for_mcp_emulation(self):
         """
-        What it does: Verifies Anthropic server-side tools are not converted to Kiro tools.
-        Purpose: Native web_search tools use Anthropic routing and are not Kiro tool specs.
+        What it does: Verifies Anthropic server-side web_search becomes a Kiro tool spec.
+        Purpose: Preserve Path B MCP interception when native web_search reaches normal flow.
         """
         print("Setup: Server-side web_search tool...")
         tools = [
@@ -1597,13 +1597,17 @@ class TestConvertAnthropicTools:
         print("Action: Converting tools...")
         result = convert_anthropic_tools(tools)
 
-        print(f"Comparing result: Expected None, Got {result}")
-        assert result is None
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].name == "web_search"
+        assert result[0].input_schema is not None
+        assert "query" in result[0].input_schema["properties"]
 
-    def test_converts_user_tool_and_skips_server_side_tool(self):
+    def test_converts_user_tool_and_server_side_web_search_tool(self):
         """
-        What it does: Verifies mixed user and server-side tools convert only user tools.
-        Purpose: Avoid sending unsupported Anthropic server tool definitions to Kiro.
+        What it does: Verifies mixed user and server-side web_search tools both convert.
+        Purpose: Keep user tools and web_search available to Kiro in normal flow.
         """
         print("Setup: Mixed user-defined and server-side tools...")
         tools = [
@@ -1623,8 +1627,28 @@ class TestConvertAnthropicTools:
 
         print(f"Result: {result}")
         assert result is not None
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0].name == "get_weather"
+        assert result[1].name == "web_search"
+
+    def test_skips_unknown_server_side_tools(self):
+        """
+        What it does: Verifies unknown Anthropic server-side tools are skipped.
+        Purpose: Avoid sending unsupported server-side tool definitions to Kiro.
+        """
+        print("Setup: Unknown server-side tool...")
+        tools = [
+            {
+                "type": "code_execution_20250522",
+                "name": "code_execution",
+            }
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Comparing result: Expected None, Got {result}")
+        assert result is None
 
 
 # ==================================================================================================
