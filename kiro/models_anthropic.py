@@ -78,6 +78,23 @@ class ToolUseContentBlock(BaseModel):
     input: Dict[str, Any]
 
 
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use content block in Anthropic format.
+
+    Anthropic emits this for server tools such as web_search. Clients may
+    replay it in subsequent requests, so the gateway accepts it as history
+    while the converter decides how to represent it for Kiro.
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
 class ToolReferenceContentBlock(BaseModel):
     """
     Tool reference content block (Claude Code deferred tools).
@@ -106,6 +123,40 @@ class ToolResultContentBlock(BaseModel):
         Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
     ] = None
     is_error: Optional[bool] = None
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchResultContentBlock(BaseModel):
+    """
+    Individual web search result returned by Anthropic server-side web_search.
+
+    Anthropic's server-side tool result content is replayed by clients in
+    later requests. The gateway stores the known fields and allows extras for
+    forward compatibility with newer Anthropic result metadata.
+    """
+
+    type: Literal["web_search_result"] = "web_search_result"
+    title: Optional[str] = None
+    url: Optional[str] = None
+    encrypted_content: Optional[str] = None
+    page_age: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Server-side web_search result content block in Anthropic format.
+
+    This block is emitted by Anthropic for native web_search and by this
+    gateway's MCP web_search emulation. It can appear in assistant messages
+    that clients replay as conversation history.
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Optional[Union[str, List[Union[TextContentBlock, WebSearchResultContentBlock, Dict[str, Any]]]]] = None
 
     model_config = {"extra": "allow"}
 
@@ -168,8 +219,10 @@ ContentBlock = Union[
     ThinkingContentBlock,
     ImageContentBlock,
     ToolUseContentBlock,
+    ServerToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 
@@ -406,7 +459,15 @@ class AnthropicMessagesResponse(BaseModel):
     id: str
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[Union[ThinkingContentBlock, TextContentBlock, ToolUseContentBlock]]
+    content: List[
+        Union[
+            ThinkingContentBlock,
+            TextContentBlock,
+            ToolUseContentBlock,
+            ServerToolUseContentBlock,
+            WebSearchToolResultContentBlock,
+        ]
+    ]
     model: str
     stop_reason: Optional[
         Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]

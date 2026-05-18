@@ -33,6 +33,9 @@ from kiro.models_anthropic import (
     AnthropicTool,
     TextContentBlock,
     ToolUseContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchResultContentBlock,
+    WebSearchToolResultContentBlock,
     ToolResultContentBlock,
     SystemContentBlock,
 )
@@ -152,6 +155,64 @@ class TestConvertAnthropicContentToText:
 
         print(f"Comparing result: Expected '42', Got '{result}'")
         assert result == "42"
+
+    def test_extracts_web_search_tool_result_from_dict(self):
+        """
+        What it does: Verifies web_search_tool_result blocks become readable text.
+        Purpose: Preserve Anthropic server-side web_search context instead of dropping it.
+        """
+        print("Setup: Content with web_search_tool_result dict...")
+        content = [
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_123",
+                "content": [
+                    {
+                        "type": "web_search_result",
+                        "title": "OpenAI Research",
+                        "url": "https://openai.com/research/",
+                        "encrypted_content": "Introducing GPT-5.5",
+                        "page_age": None,
+                    }
+                ],
+            }
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Result: {result}")
+        assert "[Web Search Results (srvtoolu_123)]" in result
+        assert "Title: OpenAI Research" in result
+        assert "URL: https://openai.com/research/" in result
+        assert "Snippet: Introducing GPT-5.5" in result
+
+    def test_extracts_web_search_tool_result_from_pydantic_model(self):
+        """
+        What it does: Verifies Pydantic web_search_tool_result blocks become text.
+        Purpose: Ensure validated Anthropic request models preserve search evidence.
+        """
+        print("Setup: Content with Pydantic WebSearchToolResultContentBlock...")
+        content = [
+            WebSearchToolResultContentBlock(
+                tool_use_id="srvtoolu_456",
+                content=[
+                    WebSearchResultContentBlock(
+                        title="AI Release Tracker",
+                        url="https://aireleasetracker.com/",
+                        encrypted_content="Mistral Medium 3.5 released",
+                    )
+                ],
+            )
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Result: {result}")
+        assert "[Web Search Results (srvtoolu_456)]" in result
+        assert "Title: AI Release Tracker" in result
+        assert "Snippet: Mistral Medium 3.5 released" in result
 
 
 # ==================================================================================================
@@ -861,6 +922,47 @@ class TestExtractToolUsesFromAnthropicContent:
         assert result[0]["id"] == "call_456"
         assert result[0]["function"]["name"] == "search"
 
+    def test_skips_server_tool_use_from_dict(self):
+        """
+        What it does: Verifies server_tool_use is not extracted as a normal tool call.
+        Purpose: Avoid forwarding unsupported Anthropic server-side tool history to Kiro.
+        """
+        print("Setup: Content with server_tool_use block...")
+        content = [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_123",
+                "name": "web_search",
+                "input": {"query": "latest AI model release 2026"},
+            }
+        ]
+
+        print("Action: Extracting tool uses...")
+        result = extract_tool_uses_from_anthropic_content(content)
+
+        print(f"Comparing result: Expected [], Got {result}")
+        assert result == []
+
+    def test_skips_server_tool_use_from_pydantic_model(self):
+        """
+        What it does: Verifies Pydantic ServerToolUseContentBlock is not a normal tool call.
+        Purpose: Ensure validated server-side blocks remain text-only context.
+        """
+        print("Setup: Content with Pydantic ServerToolUseContentBlock...")
+        content = [
+            ServerToolUseContentBlock(
+                id="srvtoolu_456",
+                name="web_search",
+                input={"query": "AI news today"},
+            )
+        ]
+
+        print("Action: Extracting tool uses...")
+        result = extract_tool_uses_from_anthropic_content(content)
+
+        print(f"Comparing result: Expected [], Got {result}")
+        assert result == []
+
     def test_extracts_multiple_tool_uses(self):
         """
         What it does: Verifies extraction of multiple tool uses.
@@ -1034,6 +1136,49 @@ class TestConvertAnthropicMessages:
         assert result[0].tool_calls is not None
         assert len(result[0].tool_calls) == 1
         assert result[0].tool_calls[0]["function"]["name"] == "get_weather"
+
+    def test_converts_assistant_message_with_server_side_web_search_history(self):
+        """
+        What it does: Verifies assistant history with server-side web_search converts.
+        Purpose: Prevent 422-era replay payloads from losing search context after validation.
+        """
+        print("Setup: Assistant message with server-side web_search blocks...")
+        messages = [
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_123",
+                        "name": "web_search",
+                        "input": {"query": "latest AI model release 2026"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_123",
+                        "content": [
+                            {
+                                "type": "web_search_result",
+                                "title": "OpenAI Research",
+                                "url": "https://openai.com/research/",
+                                "encrypted_content": "Introducing GPT-5.5",
+                            }
+                        ],
+                    },
+                    {"type": "text", "text": "Here is what I found."},
+                ],
+            )
+        ]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0].role == "assistant"
+        assert "Title: OpenAI Research" in result[0].content
+        assert "Here is what I found." in result[0].content
+        assert result[0].tool_calls is None
 
     def test_converts_user_message_with_tool_result(self):
         """
@@ -1434,6 +1579,52 @@ class TestConvertAnthropicTools:
         print(f"Result: {result}")
         assert result is not None
         assert result[0].description is None
+
+    def test_skips_server_side_tools(self):
+        """
+        What it does: Verifies Anthropic server-side tools are not converted to Kiro tools.
+        Purpose: Native web_search tools use Anthropic routing and are not Kiro tool specs.
+        """
+        print("Setup: Server-side web_search tool...")
+        tools = [
+            AnthropicTool(
+                type="web_search_20250305",
+                name="web_search",
+                max_uses=1,
+            )
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Comparing result: Expected None, Got {result}")
+        assert result is None
+
+    def test_converts_user_tool_and_skips_server_side_tool(self):
+        """
+        What it does: Verifies mixed user and server-side tools convert only user tools.
+        Purpose: Avoid sending unsupported Anthropic server tool definitions to Kiro.
+        """
+        print("Setup: Mixed user-defined and server-side tools...")
+        tools = [
+            AnthropicTool(
+                name="get_weather",
+                description="Get weather",
+                input_schema={"type": "object"},
+            ),
+            AnthropicTool(
+                type="web_search_20250305",
+                name="web_search",
+            ),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].name == "get_weather"
 
 
 # ==================================================================================================

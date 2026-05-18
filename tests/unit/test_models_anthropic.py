@@ -20,8 +20,11 @@ from kiro.models_anthropic import (
     TextContentBlock,
     ThinkingContentBlock,
     ToolUseContentBlock,
+    ServerToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    WebSearchResultContentBlock,
+    WebSearchToolResultContentBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -371,6 +374,24 @@ class TestContentBlockUnion:
         print(f"Result: {block}")
         print(f"Comparing type: Expected 'tool_use', Got '{block.type}'")
         assert block.type == "tool_use"
+
+    def test_accepts_server_tool_use_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts ServerToolUseContentBlock.
+        Purpose: Ensure replayed Anthropic server-side tool calls do not trigger 422.
+        """
+        print("Setup: Creating ServerToolUseContentBlock...")
+        block: ContentBlock = ServerToolUseContentBlock(
+            id="srvtoolu_123",
+            name="web_search",
+            input={"query": "latest AI model release 2026"},
+        )
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'server_tool_use', Got '{block.type}'")
+        assert block.type == "server_tool_use"
+        assert block.name == "web_search"
+        assert block.input["query"] == "latest AI model release 2026"
     
     def test_accepts_tool_result_content_block(self):
         """
@@ -386,6 +407,28 @@ class TestContentBlockUnion:
         print(f"Result: {block}")
         print(f"Comparing type: Expected 'tool_result', Got '{block.type}'")
         assert block.type == "tool_result"
+
+    def test_accepts_web_search_tool_result_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts WebSearchToolResultContentBlock.
+        Purpose: Ensure replayed server-side web_search results validate correctly.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock...")
+        block: ContentBlock = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_123",
+            content=[
+                WebSearchResultContentBlock(
+                    title="OpenAI Research",
+                    url="https://openai.com/research/index/release/",
+                    encrypted_content="Introducing GPT-5.5",
+                )
+            ],
+        )
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'web_search_tool_result', Got '{block.type}'")
+        assert block.type == "web_search_tool_result"
+        assert block.content[0].type == "web_search_result"
 
 
 # ==================================================================================================
@@ -618,8 +661,101 @@ class TestAnthropicMessagesRequestWithImages:
         
         # Third message is string (user follow-up)
         assert request.messages[2].content == "Can you describe it in more detail?"
-        
-        print("Multi-turn conversation with images validated successfully!")
+
+
+# ==================================================================================================
+# Tests for AnthropicMessagesRequest with Server-Side Tool Content
+# ==================================================================================================
+
+class TestAnthropicMessagesRequestWithServerSideTools:
+    """Tests for AnthropicMessagesRequest with replayed server-side tool content."""
+
+    def test_request_with_server_tool_use_and_tool_use_validates(self):
+        """
+        What it does: Verifies requests accept mixed server_tool_use and tool_use blocks.
+        Purpose: Prevent 422 validation errors when clients replay web_search history.
+        """
+        print("Setup: Creating request with server-side web_search history...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Find recent model news."),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {
+                            "type": "text",
+                            "text": "\n<web_search>\nSearch results\n</web_search>\n",
+                        },
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_c4b4551c115d4e9f86367d8213ac4876",
+                            "name": "web_search",
+                            "input": {"query": "latest AI model release 2026"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "tooluse_APwgalIAY6Qy6FZAE5cAf0",
+                            "name": "web_search",
+                            "input": {
+                                "query": "AI news today tech May 2026",
+                                "freshness": "pd",
+                                "count": 10,
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        print(f"Result: {request}")
+        assert len(request.messages) == 2
+        assert request.messages[1].content[1].type == "server_tool_use"
+        assert request.messages[1].content[2].type == "tool_use"
+
+    def test_request_with_web_search_tool_result_validates(self):
+        """
+        What it does: Verifies requests accept web_search_tool_result blocks.
+        Purpose: Ensure non-streaming and streaming web_search results can be replayed.
+        """
+        print("Setup: Creating request with web_search_tool_result history...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Search current AI news."),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_123",
+                            "name": "web_search",
+                            "input": {"query": "AI news today"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_123",
+                            "content": [
+                                {
+                                    "type": "web_search_result",
+                                    "title": "OpenAI Research",
+                                    "url": "https://openai.com/research/",
+                                    "encrypted_content": "Latest model release details",
+                                    "page_age": None,
+                                }
+                            ],
+                        },
+                        {"type": "text", "text": "Here are the results."},
+                    ],
+                ),
+            ],
+        )
+
+        print(f"Result: {request}")
+        assert request.messages[1].content[1].type == "web_search_tool_result"
+        assert request.messages[1].content[1].content[0].type == "web_search_result"
 
 
 # ==================================================================================================
@@ -1438,6 +1574,40 @@ class TestAnthropicMessagesResponse:
         
         print(f"Comparing model: Expected 'claude-sonnet-4-5', Got '{response.model}'")
         assert response.model == "claude-sonnet-4-5"
+
+    def test_response_accepts_server_side_web_search_blocks(self):
+        """
+        What it does: Verifies AnthropicMessagesResponse accepts server-side web_search content.
+        Purpose: Ensure the gateway's native web_search response schema matches emitted data.
+        """
+        print("Setup: Creating response with server-side web_search blocks...")
+        response = AnthropicMessagesResponse(
+            id="msg_123",
+            model="claude-sonnet-4-6",
+            content=[
+                ServerToolUseContentBlock(
+                    id="srvtoolu_123",
+                    name="web_search",
+                    input={"query": "AI news today"},
+                ),
+                WebSearchToolResultContentBlock(
+                    tool_use_id="srvtoolu_123",
+                    content=[
+                        WebSearchResultContentBlock(
+                            title="OpenAI Research",
+                            url="https://openai.com/research/",
+                            encrypted_content="Latest model release details",
+                        )
+                    ],
+                ),
+                TextContentBlock(text="Search complete."),
+            ],
+            usage=AnthropicUsage(input_tokens=10, output_tokens=5),
+        )
+
+        print(f"Result: {response}")
+        assert response.content[0].type == "server_tool_use"
+        assert response.content[1].type == "web_search_tool_result"
     
     def test_stop_reason_values(self):
         """
